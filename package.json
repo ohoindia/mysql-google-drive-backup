@@ -1,0 +1,16 @@
+{
+  "name": "mysql-rds-google-drive-backup",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Scheduled AWS Lambda backup of an RDS MySQL database to personal Google Drive",
+  "main": "index.js",
+  "scripts": {
+    "generate-google-token": "node scripts/generate-refresh-token.js"
+  },
+  "dependencies": {
+    "googleapis": "^160.0.0"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}
