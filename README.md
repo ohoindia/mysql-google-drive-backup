@@ -1,14 +1,27 @@
 # AWS RDS MySQL Backup to Personal Google Drive
 
-This project runs as an AWS Lambda container image. It:
+This project runs as an **AWS Lambda container image** and performs the following flow:
 
-1. Connects to an AWS-hosted MySQL/RDS database.
-2. Runs `mysqldump`.
-3. Compresses the dump using gzip.
-4. Streams the compressed backup directly to a folder in your personal Google Drive.
-5. Can be invoked on a schedule using Amazon EventBridge Scheduler.
+```text
+Amazon EventBridge Scheduler
+            |
+            v
+       AWS Lambda
+            |
+            v
+     AWS RDS MySQL
+            |
+        mysqldump
+            |
+           gzip
+            |
+            v
+ Personal Google Drive
+```
 
-The backup is streamed and is not accumulated in Lambda memory or written as a complete file under `/tmp`.
+The database dump is streamed through gzip and uploaded directly to Google Drive. The complete backup is not loaded into Lambda memory and does not need to be written to `/tmp`.
+
+---
 
 ## Project structure
 
@@ -25,76 +38,395 @@ mysql-rds-google-drive-backup/
     └── generate-refresh-token.js
 ```
 
-## 1. Google Cloud setup for Personal Google Drive
+---
 
-1. Open Google Cloud Console.
-2. Create or select a project.
-3. Enable **Google Drive API**.
-4. Configure the OAuth consent screen.
-5. Create an OAuth client ID.
-6. Choose **Desktop app** as the OAuth client type.
-7. Copy the client ID and client secret.
+## 1. Prerequisites
 
-For an app still in Google OAuth "Testing" mode, add your personal Google account as a test user.
+Install the following on your development machine:
 
-## 2. Generate a Google refresh token
+- AWS CLI
+- Docker Desktop
+- WSL 2 on Windows
+- Node.js 22+ for generating the Google refresh token
 
-On your local computer:
+Verify:
 
-```bash
+```powershell
+aws --version
+docker --version
+node --version
+npm --version
+```
+
+Docker must also have a working Linux engine:
+
+```powershell
+docker version
+docker run hello-world
+```
+
+On Windows, if WSL is not installed, open PowerShell **as Administrator** and run:
+
+```powershell
+wsl --install
+```
+
+Restart Windows if required, then verify:
+
+```powershell
+wsl --status
+wsl -l -v
+```
+
+---
+
+## 2. Google Cloud setup for Personal Google Drive
+
+### 2.1 Create/select a Google Cloud project
+
+Open Google Cloud Console and create/select a project, for example:
+
+```text
+MySQL RDS Backup
+```
+
+### 2.2 Enable Google Drive API
+
+Go to:
+
+```text
+APIs & Services
+  -> Library
+  -> Google Drive API
+  -> Enable
+```
+
+### 2.3 Configure OAuth consent
+
+Go to:
+
+```text
+Google Auth Platform
+  -> Branding / Audience
+```
+
+Configure the application.
+
+If the application is in **Testing** mode, add the personal Google account that owns the backup folder under:
+
+```text
+Audience
+  -> Test users
+  -> Add users
+```
+
+Otherwise Google may return:
+
+```text
+Error 403: access_denied
+```
+
+### 2.4 Create OAuth client credentials
+
+Create a new OAuth client:
+
+```text
+Application type: Desktop app
+Name: MySQL Backup OAuth Client
+```
+
+Save:
+
+```text
+GOOGLE_CLIENT_ID
+GOOGLE_CLIENT_SECRET
+```
+
+---
+
+## 3. Generate GOOGLE_REFRESH_TOKEN
+
+Install Node dependencies locally:
+
+```powershell
 npm install
 ```
 
-Set the client ID and secret or enter them when prompted.
-
-Windows PowerShell:
+Set your OAuth values in PowerShell:
 
 ```powershell
 $env:GOOGLE_CLIENT_ID="your-client-id.apps.googleusercontent.com"
 $env:GOOGLE_CLIENT_SECRET="your-client-secret"
+```
+
+Generate the token:
+
+```powershell
 npm run generate-google-token
 ```
 
-macOS/Linux:
+Open the displayed Google authorization URL and log in using the personal Google account that will store the backups.
 
-```bash
-export GOOGLE_CLIENT_ID="your-client-id.apps.googleusercontent.com"
-export GOOGLE_CLIENT_SECRET="your-client-secret"
-npm run generate-google-token
-```
-
-The script opens an OAuth flow. After you approve access with your personal Google account, it prints:
+After approval, the script prints something like:
 
 ```text
-GOOGLE_REFRESH_TOKEN=1//...
+GOOGLE_REFRESH_TOKEN=1//xxxxxxxxxxxxxxxxxxxxxxxx
 ```
 
-Save that token securely.
+Store this token securely.
 
-## 3. Create a Google Drive folder
+---
 
-Create a folder in My Drive, for example:
+## 4. Google Drive backup folder
+
+Create a folder in your personal Google Drive, for example:
 
 ```text
 My Drive
 └── Database Backups
 ```
 
-A folder URL looks similar to:
+For this project, the selected folder is:
 
 ```text
-https://drive.google.com/drive/folders/1AbCdEfGhIjKlMnOpQrStUv
+https://drive.google.com/drive/u/0/folders/1SnYYkMtMzqAgGB8tV_yIJwI1yfNNi8Pj
 ```
 
-Set:
+Therefore:
 
 ```text
-GOOGLE_DRIVE_FOLDER_ID=1AbCdEfGhIjKlMnOpQrStUv
+GOOGLE_DRIVE_FOLDER_ID=1SnYYkMtMzqAgGB8tV_yIJwI1yfNNi8Pj
 ```
 
-## 4. Lambda environment variables
+Only the folder ID is required, not the complete URL.
+
+---
+
+## 5. AWS CLI configuration
+
+Configure AWS CLI:
+
+```powershell
+aws configure
+```
+
+Verify the authenticated AWS account:
+
+```powershell
+aws sts get-caller-identity
+```
+
+This project currently uses:
+
+```text
+AWS Account ID: 640168439195
+AWS Region:     ap-south-1
+ECR Repository: mysql-rds-google-drive-backup
+```
+
+---
+
+## 6. Create the ECR repository
+
+Create the repository once:
+
+```powershell
+aws ecr create-repository `
+  --repository-name mysql-rds-google-drive-backup `
+  --region ap-south-1
+```
+
+If it already exists, this step can be skipped.
+
+ECR repository URI:
+
+```text
+640168439195.dkr.ecr.ap-south-1.amazonaws.com/mysql-rds-google-drive-backup
+```
+
+---
+
+## 7. Login Docker to Amazon ECR
+
+Make sure Docker Desktop is running first.
+
+Verify:
+
+```powershell
+docker info
+```
+
+Then log in to ECR:
+
+```powershell
+aws ecr get-login-password --region ap-south-1 | docker login --username AWS --password-stdin 640168439195.dkr.ecr.ap-south-1.amazonaws.com
+```
+
+Expected output:
+
+```text
+Login Succeeded
+```
+
+If Docker reports errors involving `dockerDesktopLinuxEngine`, restart Docker Desktop and WSL:
+
+```powershell
+wsl --shutdown
+```
+
+Then reopen Docker Desktop and verify:
+
+```powershell
+docker run hello-world
+```
+
+---
+
+## 8. Build the Lambda-compatible Docker image
+
+AWS Lambda requires a single-architecture image with a compatible manifest.
+
+Use **Buildx**, `linux/amd64`, and disable provenance:
+
+```powershell
+docker buildx build `
+  --platform linux/amd64 `
+  --provenance=false `
+  --load `
+  -t mysql-rds-google-drive-backup:latest .
+```
+
+The `--provenance=false` option is important. Without it, Lambda may reject the ECR image with an error similar to:
+
+```text
+The image manifest, config or layer media type for the source image is not supported.
+```
+
+Verify the local image:
+
+```powershell
+docker images
+```
+
+---
+
+## 9. Tag the Docker image for ECR
+
+```powershell
+docker tag mysql-rds-google-drive-backup:latest 640168439195.dkr.ecr.ap-south-1.amazonaws.com/mysql-rds-google-drive-backup:latest
+```
+
+Optional versioned tag:
+
+```powershell
+docker tag mysql-rds-google-drive-backup:latest 640168439195.dkr.ecr.ap-south-1.amazonaws.com/mysql-rds-google-drive-backup:v1
+```
+
+Versioned tags are recommended because they make deployments easier to trace.
+
+---
+
+## 10. Upload / Push Docker image to ECR
+
+Push `latest`:
+
+```powershell
+docker push 640168439195.dkr.ecr.ap-south-1.amazonaws.com/mysql-rds-google-drive-backup:latest
+```
+
+Or push a versioned image:
+
+```powershell
+docker push 640168439195.dkr.ecr.ap-south-1.amazonaws.com/mysql-rds-google-drive-backup:v1
+```
+
+After the push, open:
+
+```text
+AWS Console
+  -> ECR
+  -> Repositories
+  -> mysql-rds-google-drive-backup
+  -> Images
+```
+
+Confirm that the new image/tag appears.
+
+---
+
+## 11. Create the AWS Lambda function
+
+Open:
+
+```text
+AWS Console
+  -> Lambda
+  -> Create function
+```
+
+Choose:
+
+```text
+Container image
+```
 
 Configure:
+
+```text
+Function name: mysql-rds-google-drive-backup
+Architecture:  x86_64
+```
+
+Select the ECR image:
+
+```text
+640168439195.dkr.ecr.ap-south-1.amazonaws.com/mysql-rds-google-drive-backup:latest
+```
+
+Create the function.
+
+---
+
+## 12. Recommended Lambda settings
+
+For a database currently around 127-130 MB:
+
+```text
+Memory:             2048 MB
+Timeout:            15 minutes
+Architecture:       x86_64
+Ephemeral storage:  512 MB
+```
+
+Because the backup is streamed, 512 MB of `/tmp` storage is sufficient for the current implementation.
+
+### Public RDS scenario
+
+If the RDS instance is publicly accessible and Lambda is not attached to a VPC, no NAT Gateway is required.
+
+Lambda needs outbound access to:
+
+```text
+RDS public endpoint : TCP 3306
+Google APIs         : HTTPS 443
+```
+
+Make sure the RDS security group allows the required database connectivity.
+
+---
+
+## 13. Lambda environment variables
+
+Go to:
+
+```text
+Lambda
+  -> Configuration
+  -> Environment variables
+  -> Edit
+```
+
+Add:
 
 ```text
 DB_HOST=<RDS endpoint>
@@ -103,68 +435,68 @@ DB_USER=<MySQL user>
 DB_PASSWORD=<MySQL password>
 DB_NAME=<database name>
 
-GOOGLE_CLIENT_ID=<OAuth client ID>
-GOOGLE_CLIENT_SECRET=<OAuth client secret>
-GOOGLE_REFRESH_TOKEN=<OAuth refresh token>
-GOOGLE_DRIVE_FOLDER_ID=<Drive folder ID>
+GOOGLE_CLIENT_ID=<Google OAuth client ID>
+GOOGLE_CLIENT_SECRET=<Google OAuth client secret>
+GOOGLE_REFRESH_TOKEN=<Google refresh token>
+GOOGLE_DRIVE_FOLDER_ID=1SnYYkMtMzqAgGB8tV_yIJwI1yfNNi8Pj
 ```
 
-For production, store DB credentials and Google OAuth secrets in AWS Secrets Manager rather than plain environment variables.
+Do not commit these secrets to Git.
 
-## 5. Build the Lambda container
+For production, consider moving sensitive values to AWS Secrets Manager.
 
-Authenticate Docker to your ECR registry, then:
+---
 
-```bash
-docker build -t mysql-rds-google-drive-backup .
-```
+## 14. Test the Lambda manually
 
-Create an ECR repository if required:
-
-```bash
-aws ecr create-repository \
-  --repository-name mysql-rds-google-drive-backup
-```
-
-Tag and push:
-
-```bash
-docker tag mysql-rds-google-drive-backup:latest \
-  <AWS_ACCOUNT_ID>.dkr.ecr.<REGION>.amazonaws.com/mysql-rds-google-drive-backup:latest
-
-docker push \
-  <AWS_ACCOUNT_ID>.dkr.ecr.<REGION>.amazonaws.com/mysql-rds-google-drive-backup:latest
-```
-
-Then create an AWS Lambda function using **Container image** and select the ECR image.
-
-## 6. Recommended Lambda settings
-
-For a database currently around 130 MB:
+In the Lambda console:
 
 ```text
-Memory:             1024-2048 MB
-Timeout:            10-15 minutes
-Architecture:       x86_64
-Ephemeral storage:  512 MB is sufficient for this streaming implementation
+Lambda
+  -> Test
+  -> Create new event
 ```
 
-The Lambda must be able to reach both:
+Use:
 
-- the RDS MySQL endpoint
-- Google's HTTPS APIs
+```json
+{}
+```
 
-### Private RDS
+Run the test.
 
-If RDS is private, put the Lambda in the appropriate VPC/subnets and allow TCP 3306 from the Lambda security group to the RDS security group.
+Expected CloudWatch logs include messages similar to:
 
-Because Google Drive is external to AWS, a VPC-attached Lambda in private subnets normally requires outbound Internet connectivity through a NAT gateway/NAT instance.
+```text
+Starting backup for database: your_database
+mysqldump completed successfully.
+Backup uploaded successfully to Google Drive.
+Google Drive file ID: xxxxxxxxx
+```
 
-## 7. EventBridge Scheduler
+Then open the configured Google Drive folder and verify the backup file exists.
 
-Create a schedule whose target is this Lambda.
+Backup filename format:
 
-Example: every day at 2:00 AM India time:
+```text
+your_database_2026-09-12T02-00-00-000Z.sql.gz
+```
+
+---
+
+## 15. Configure EventBridge Scheduler
+
+After a successful manual Lambda test, create the daily schedule.
+
+Go to:
+
+```text
+Amazon EventBridge
+  -> Scheduler
+  -> Create schedule
+```
+
+Example daily schedule at 2:00 AM IST:
 
 ```text
 Schedule expression:
@@ -174,24 +506,92 @@ Timezone:
 Asia/Kolkata
 ```
 
-Use your preferred timezone and execution time.
-
-## 8. Backup filename
-
-Files are generated with names similar to:
+Target:
 
 ```text
-your_database_2026-09-11T02-00-00-000Z.sql.gz
+AWS Lambda
 ```
 
-## 9. Restore
+Function:
 
-Download the `.sql.gz` backup and extract it.
+```text
+mysql-rds-google-drive-backup
+```
 
-Linux/macOS:
+Use your preferred execution time and timezone.
+
+---
+
+## 16. Updating and redeploying the Lambda
+
+Whenever `index.js`, `Dockerfile`, `package.json`, or another project file changes, rebuild and push a new container image.
+
+### Step 1 - Build
+
+```powershell
+docker buildx build `
+  --platform linux/amd64 `
+  --provenance=false `
+  --load `
+  -t mysql-rds-google-drive-backup:v2 .
+```
+
+### Step 2 - Tag
+
+```powershell
+docker tag mysql-rds-google-drive-backup:v2 640168439195.dkr.ecr.ap-south-1.amazonaws.com/mysql-rds-google-drive-backup:v2
+```
+
+### Step 3 - Push
+
+```powershell
+docker push 640168439195.dkr.ecr.ap-south-1.amazonaws.com/mysql-rds-google-drive-backup:v2
+```
+
+### Step 4 - Update Lambda
+
+In AWS Console:
+
+```text
+Lambda
+  -> mysql-rds-google-drive-backup
+  -> Image
+  -> Deploy new image
+```
+
+Select the new ECR image/tag.
+
+Alternatively with AWS CLI:
+
+```powershell
+aws lambda update-function-code `
+  --function-name mysql-rds-google-drive-backup `
+  --image-uri 640168439195.dkr.ecr.ap-south-1.amazonaws.com/mysql-rds-google-drive-backup:v2 `
+  --region ap-south-1
+```
+
+Wait for the function to finish updating:
+
+```powershell
+aws lambda wait function-updated `
+  --function-name mysql-rds-google-drive-backup `
+  --region ap-south-1
+```
+
+Then test the Lambda again.
+
+---
+
+## 17. Restore a backup using local MySQL tools
+
+Download the `.sql.gz` backup file from Google Drive.
+
+### Linux/macOS
+
+Extract:
 
 ```bash
-gunzip your_database_2026-09-11T02-00-00-000Z.sql.gz
+gunzip your_database_2026-09-12T02-00-00-000Z.sql.gz
 ```
 
 Restore:
@@ -203,14 +603,99 @@ mysql \
   -u <user> \
   -p \
   <database> \
-  < your_database_2026-09-11T02-00-00-000Z.sql
+  < your_database_2026-09-12T02-00-00-000Z.sql
 ```
 
-## 10. MySQL permissions
+### Windows PowerShell
 
-The database user must have sufficient permissions to read all objects being backed up.
+If you have MySQL client installed:
 
-The dump command uses:
+```powershell
+mysql.exe -h <host> -P 3306 -u <user> -p <database> < backup.sql
+```
+
+PowerShell's input redirection behavior can vary depending on shell/version. If required, run the restore from `cmd.exe`:
+
+```cmd
+mysql.exe -h <host> -P 3306 -u <user> -p database_name < backup.sql
+```
+
+---
+
+## 18. Restore a backup using Docker
+
+You can restore without installing MySQL client locally.
+
+### Step 1 - Download and extract the backup
+
+Download the `.sql.gz` file from Google Drive and extract it to a local folder.
+
+Example:
+
+```text
+C:\Backups\ohoindiaprod_2026-09-12.sql
+```
+
+### Step 2 - Run MySQL client from Docker
+
+From PowerShell, change to the backup directory:
+
+```powershell
+cd C:\Backups
+```
+
+For PowerShell, pipe the SQL file into a temporary MySQL client container:
+
+```powershell
+Get-Content .\ohoindiaprod_2026-09-12.sql -Raw | docker run --rm -i mysql:8.0 mysql -h <RDS_HOST> -P 3306 -u <DB_USER> -p<DB_PASSWORD> <DB_NAME>
+```
+
+For very large SQL files, `cmd.exe` redirection is usually more efficient:
+
+```cmd
+docker run --rm -i mysql:8.0 mysql -h <RDS_HOST> -P 3306 -u <DB_USER> -p<DB_PASSWORD> <DB_NAME> < ohoindiaprod_2026-09-12.sql
+```
+
+> Note: There must be no space between `-p` and the password when passing it inline. For better security, avoid putting passwords in shell history when possible.
+
+### Restore from gzip without manually extracting (Linux/macOS)
+
+```bash
+gunzip -c backup.sql.gz | docker run --rm -i mysql:8.0 mysql \
+  -h <RDS_HOST> \
+  -P 3306 \
+  -u <DB_USER> \
+  -p<DB_PASSWORD> \
+  <DB_NAME>
+```
+
+---
+
+## 19. Backup verification
+
+Do not rely only on the successful Lambda response.
+
+Recommended checks:
+
+1. Confirm the `.sql.gz` file appears in Google Drive.
+2. Confirm the file size is greater than zero.
+3. Download and decompress a sample backup.
+4. Check that it contains `CREATE TABLE` / `INSERT` statements as expected.
+5. Periodically restore a backup into a temporary/test database.
+
+Example test database:
+
+```sql
+CREATE DATABASE backup_restore_test;
+```
+
+Then restore the dump into that database and verify important tables and row counts.
+
+---
+
+## 20. MySQL backup options used
+
+The Lambda dump command uses:
 
 ```text
 --single-transaction
@@ -223,20 +708,54 @@ The dump command uses:
 --default-character-set=utf8mb4
 ```
 
-If the user cannot read routines/events, remove those dump options or grant the required privileges.
+If the backup user does not have permission to read routines/events, remove those options or grant the required privileges.
 
-## 11. Security recommendations
+---
 
-Do not commit `.env`, database passwords, OAuth client secrets, or refresh tokens to Git.
+## 21. Security recommendations
 
-For production, use AWS Secrets Manager for:
+Do not commit the following values to Git:
 
-- DB username/password
-- Google client ID/client secret
-- Google refresh token
+```text
+DB_PASSWORD
+GOOGLE_CLIENT_SECRET
+GOOGLE_REFRESH_TOKEN
+```
 
-Also consider:
+Recommended production improvements:
 
-- CloudWatch alarms for Lambda failures.
-- Google Drive retention/cleanup rules implemented as a separate maintenance job.
-- RDS automated snapshots in addition to logical SQL backups.
+- Store database credentials in AWS Secrets Manager.
+- Store Google OAuth credentials/refresh token in AWS Secrets Manager.
+- Restrict MySQL access as much as possible.
+- Enable CloudWatch alarms for Lambda failures.
+- Keep RDS automated snapshots enabled in addition to logical SQL backups.
+- Periodically restore and validate Google Drive backups.
+- Define a retention policy if daily backups accumulate over time.
+
+---
+
+## 22. Quick deployment command reference
+
+For normal future deployments:
+
+```powershell
+# Login to ECR
+aws ecr get-login-password --region ap-south-1 | docker login --username AWS --password-stdin 640168439195.dkr.ecr.ap-south-1.amazonaws.com
+
+# Build Lambda-compatible image
+docker buildx build --platform linux/amd64 --provenance=false --load -t mysql-rds-google-drive-backup:v2 .
+
+# Tag
+docker tag mysql-rds-google-drive-backup:v2 640168439195.dkr.ecr.ap-south-1.amazonaws.com/mysql-rds-google-drive-backup:v2
+
+# Push
+docker push 640168439195.dkr.ecr.ap-south-1.amazonaws.com/mysql-rds-google-drive-backup:v2
+
+# Update Lambda
+aws lambda update-function-code --function-name mysql-rds-google-drive-backup --image-uri 640168439195.dkr.ecr.ap-south-1.amazonaws.com/mysql-rds-google-drive-backup:v2 --region ap-south-1
+
+# Wait until update completes
+aws lambda wait function-updated --function-name mysql-rds-google-drive-backup --region ap-south-1
+```
+
+Then execute a Lambda test and confirm the new backup appears in Google Drive.
