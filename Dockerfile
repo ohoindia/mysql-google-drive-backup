@@ -17,6 +17,6 @@ RUN if command -v mariadb-dump >/dev/null 2>&1; then \
 COPY package*.json ${LAMBDA_TASK_ROOT}/
 RUN npm install --omit=dev
 
-COPY index.js ${LAMBDA_TASK_ROOT}/
+COPY index.js notifications.js ${LAMBDA_TASK_ROOT}/
 
 CMD ["index.handler"]

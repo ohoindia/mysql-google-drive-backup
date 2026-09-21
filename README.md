@@ -112,6 +112,12 @@ Google Auth Platform
 
 Configure the application.
 
+For unattended backups, set **Audience -> Publishing status -> In production**
+before generating the refresh token. With Drive access, an external app in
+**Testing** receives refresh tokens that expire after **7 days**. Publishing
+removes that testing limit; tokens can still be revoked or expire for other
+reasons. See [Google's refresh token expiration rules](https://developers.google.com/identity/protocols/oauth2#expiration).
+
 If the application is in **Testing** mode, add the personal Google account that owns the backup folder under:
 
 ```text
@@ -174,6 +180,49 @@ GOOGLE_REFRESH_TOKEN=1//xxxxxxxxxxxxxxxxxxxxxxxx
 ```
 
 Store this token securely.
+
+Run the script and open the browser on the **same computer**. Keep the terminal
+running until authorization finishes. Use the same client ID and client secret
+in Lambda as you used to generate the token. The script uses environment
+variables or prompts; it does not automatically load `.env`.
+
+### Recover from `invalid_grant` / token generation problems
+
+Personal Google Drive requires user OAuth authorization. This scheduled Lambda
+needs `GOOGLE_REFRESH_TOKEN` to obtain new access tokens without asking you to log
+in for every backup. Removing it will not fix expired authorization. Service
+accounts cannot own files or use personal Drive storage; see
+[Google's service account limitation](https://developers.google.com/workspace/drive/api/guides/about-shareddrives).
+
+1. If a refresh token appeared in logs or chat, remove this app's access from
+   [Google Account connections](https://myaccount.google.com/connections) before
+   reauthorizing. This invalidates the app's existing authorization.
+2. Set the OAuth app to **In production** as described above.
+3. Use the **Desktop app** OAuth client credentials and run
+   `npm run generate-google-token` locally. Sign in as the Drive folder owner.
+4. Replace Lambda's `GOOGLE_REFRESH_TOKEN`. If you created a new OAuth client,
+   replace `GOOGLE_CLIENT_ID` and `GOOGLE_CLIENT_SECRET` too.
+5. Run a manual Lambda test and verify the backup appears in Drive. Rebuild and
+   redeploy the container to install code changes; replacing environment values
+   alone does not require rebuilding the image.
+
+Common generation failures:
+
+| Symptom | Action |
+| --- | --- |
+| `access_denied` / 403 during sign-in | In Testing, add the signing-in account as a test user. Check that you approved the requested access. |
+| `redirect_uri_mismatch` | Use a Desktop app client. If intentionally using a Web application client, register exactly `http://localhost:3000/oauth2callback` as an authorized redirect URI. |
+| Browser cannot reach localhost | Run the browser on the computer running the script and keep the script running. |
+| Port 3000 is busy | Stop the earlier token generator or other listener and retry. |
+| `invalid_client` | Check the client ID and secret come from the same OAuth client. |
+| No refresh token returned | Remove the app's existing Google Account connection, then rerun and consent again. |
+
+The script requests `drive.file`, which only grants access to files/folders
+created by or explicitly opened with this app. Pasting an existing folder ID
+does not itself grant access. If authorization succeeds but upload reports
+`File not found`, ensure the destination folder is authorized for this app
+(for example through Google Picker) or created by this app. See
+[Drive scopes](https://developers.google.com/workspace/drive/api/guides/api-specific-auth).
 
 ---
 
@@ -444,6 +493,55 @@ GOOGLE_DRIVE_FOLDER_ID=1SnYYkMtMzqAgGB8tV_yIJwI1yfNNi8Pj
 Do not commit these secrets to Git.
 
 For production, consider moving sensitive values to AWS Secrets Manager.
+
+### Brevo email notifications (no template required)
+
+Notifications use Brevo SMTP with STARTTLS on `smtp-relay.brevo.com:587`.
+The subject and plain-text body are composed by the application for both success
+and failure. No saved template, template ID, or email API key is required.
+
+Configure these Lambda environment variables:
+
+```text
+BREVO_SMTP_LOGIN=<SMTP login shown in Brevo SMTP & API settings>
+BREVO_SMTP_KEY=<Brevo SMTP key>
+BREVO_EMAIL_FROM=<verified sender at ohoindialife.com>
+BREVO_EMAIL_FROM_NAME=Database Backup
+BREVO_EMAIL_TO=<recipient email>
+```
+
+The SMTP login is separate from your sender address and Brevo account login.
+The SMTP key is used as the SMTP password; it cannot replace a REST API key.
+`BREVO_EMAIL_FROM_NAME` is optional. `BREVO_EMAIL_TO` accepts comma-separated
+addresses; duplicates are removed and Bcc protects recipient privacy.
+See [Brevo SMTP credentials](https://help.brevo.com/hc/en-us/articles/7959631848850-Create-and-manage-your-SMTP-keys).
+
+Keep the key in Lambda environment configuration or a secret store, never in
+source control. `.env` is ignored by Git and Docker; Lambda does not load it.
+For local tools with Node 22, `--env-file=.env` loads local configuration.
+Rebuild and redeploy the container so the Nodemailer dependency is installed.
+Lambda needs outbound TCP 587 to Brevo, in addition to its database/Drive access.
+
+Select the Free plan in your Brevo account. It currently includes
+[300 email sends per day](https://help.brevo.com/hc/en-us/articles/208580669-FAQs-What-are-the-limits-of-the-Free-plan).
+One invocation sends one outcome message to each unique recipient. Manual runs,
+Lambda retries and other applications using the same account also consume quota.
+No notification retries or paid plan upgrades are performed by this application.
+There is no application-wide quota counter; check usage in Brevo.
+
+Success messages contain the database, timestamp, file details, Drive link and
+Lambda request ID. Caught errors, including missing backup configuration, send
+failure messages with safe diagnostics. Credentials and database contents are
+excluded. Missing email settings or SMTP failures are logged without changing the
+backup outcome. Success responses include `notification.status` (`accepted` or
+`failed`). Partial recipient rejection is reported as failed; recipients already
+accepted may still receive their copy. SMTP acceptance does not prove delivery;
+check Brevo's transactional email logs.
+
+SMTP connection, greeting, DNS and idle socket timeouts are each 10 seconds;
+leave sufficient Lambda runtime headroom for these stages. Hard Lambda timeouts,
+out-of-memory termination and failures before handler loading require a separate
+CloudWatch alarm path. No email can be sent by this handler after it is terminated.
 
 ---
 

@@ -1,7 +1,9 @@
 const { spawn } = require("child_process");
 const zlib = require("zlib");
 const { PassThrough } = require("stream");
+const { pipeline } = require("stream/promises");
 const { google } = require("googleapis");
+const { notifyBackup } = require("./notifications");
 
 function requireEnv(name) {
   const value = process.env[name];
@@ -31,7 +33,7 @@ function createDriveClient() {
   });
 }
 
-exports.handler = async () => {
+async function runBackup() {
   const DB_HOST = requireEnv("DB_HOST");
   const DB_USER = requireEnv("DB_USER");
   const DB_PASSWORD = requireEnv("DB_PASSWORD");
@@ -78,7 +80,7 @@ exports.handler = async () => {
   const gzip = zlib.createGzip({ level: 6 });
   const uploadStream = new PassThrough();
 
-  dump.stdout.pipe(gzip).pipe(uploadStream);
+  const streamPromise = pipeline(dump.stdout, gzip, uploadStream);
 
   let dumpError = "";
 
@@ -86,15 +88,6 @@ exports.handler = async () => {
     const message = data.toString();
     dumpError += message;
     console.error(`[mysqldump] ${message.trim()}`);
-  });
-
-  dump.stdout.on("error", (error) => {
-    console.error("mysqldump stdout error:", error);
-  });
-
-  gzip.on("error", (error) => {
-    console.error("gzip error:", error);
-    uploadStream.destroy(error);
   });
 
   const dumpPromise = new Promise((resolve, reject) => {
@@ -116,7 +109,7 @@ exports.handler = async () => {
     });
   });
 
-  const uploadPromise = drive.files.create({
+  const uploadPromise = Promise.resolve().then(() => drive.files.create({
     requestBody: {
       name: fileName,
       parents: [GOOGLE_DRIVE_FOLDER_ID],
@@ -126,12 +119,13 @@ exports.handler = async () => {
       body: uploadStream,
     },
     fields: "id,name,size,webViewLink,createdTime",
-  });
+  }));
 
   try {
     const [, uploadResult] = await Promise.all([
       dumpPromise,
       uploadPromise,
+      streamPromise,
     ]);
 
     const file = uploadResult.data;
@@ -150,13 +144,62 @@ exports.handler = async () => {
       backupDate: now.toISOString(),
     };
   } catch (error) {
-    console.error("Backup failed:", error);
+    // Gaxios errors contain request bodies, including the refresh token.
+    // Throw a fresh error too: Lambda logs unhandled exceptions automatically.
+    const message = error?.response?.data?.error === "invalid_grant"
+      ? "Google Drive authorization expired or was revoked. Set the OAuth app " +
+        "to Production, run npm run generate-google-token locally, and update " +
+        "Lambda GOOGLE_REFRESH_TOKEN using the same OAuth client credentials."
+      : "Backup failed. Check database connectivity, Google Drive authorization, " +
+        "and access to GOOGLE_DRIVE_FOLDER_ID.";
+    console.error(message);
 
     // Stop the dump if Drive upload fails.
     if (!dump.killed) {
       dump.kill("SIGTERM");
     }
+    uploadStream.destroy();
+    gzip.destroy();
+    dump.stdout.destroy();
 
-    throw error;
+    throw new Error(message);
   }
+}
+
+exports.handler = async (event, context) => {
+  const startedAt = new Date().toISOString();
+  let result;
+  try {
+    result = await runBackup();
+  } catch (error) {
+    // Only send known safe messages, never raw SDK errors or database output.
+    const message = /^(Missing required environment variable: [A-Z_]+|Google Drive authorization expired or was revoked\.|Backup failed\.)/.test(error?.message || "")
+      ? error.message
+      : "Backup failed during initialization. Check the Lambda logs and configuration.";
+    await notifyBackup({
+      status: "FAILED",
+      database: process.env.DB_NAME || "Unknown",
+      backup_date: startedAt,
+      file_name: "",
+      file_id: "",
+      file_size: "",
+      drive_link: "",
+      message,
+      request_id: context?.awsRequestId || "",
+    });
+    throw new Error(message);
+  }
+
+  const notification = await notifyBackup({
+    status: "SUCCESS",
+    database: result.database,
+    backup_date: result.backupDate,
+    file_name: result.fileName,
+    file_id: result.fileId,
+    file_size: result.fileSize || "",
+    drive_link: result.webViewLink || "",
+    message: result.message,
+    request_id: context?.awsRequestId || "",
+  });
+  return { ...result, notification };
 };
